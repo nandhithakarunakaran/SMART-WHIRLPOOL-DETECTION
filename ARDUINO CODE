@@ -1,0 +1,1101 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <TinyGPS++.h>
+const char* WIFI_SSID = "IOT";
+const char* WIFI_PASSWORD = "IOT@123456789";
+const char* THINGSPEAK_API_KEY = "0M06FXCU6AWV0XDD";
+const char* THINGSPEAK_URL =
+  "https://api.thingspeak.com/update";
+#define MEMS_PIN 34
+#define FLOW_PIN 33
+#define OBJECT_TRIG_PIN 22
+#define OBJECT_ECHO_PIN 23
+#define DEPTH_TRIG_PIN 21
+#define DEPTH_ECHO_PIN 19
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+#define RED_LED 25
+#define YELLOW_LED 26
+#define GREEN_LED 27
+#define MOTOR_A_I1 15
+#define MOTOR_A_I2 2
+#define MOTOR_B_I3 5
+#define MOTOR_B_I4 18
+#define OBJECT_THRESHOLD 10.0
+#define MEMS_THRESHOLD 4000
+#define WHIRLPOOL_DEPTH_THRESHOLD 30.0
+#define WHIRLPOOL_FLOW_THRESHOLD 2.0
+#define THINGSPEAK_INTERVAL 20000
+#define REVERSE_TIME 500
+#define TURN_TIME 800
+#define FLOW_PULSES_PER_LITER 450.0
+volatile unsigned long flowPulseCount = 0;
+unsigned long lastFlowCalculation = 0;
+
+float flowRate = 0.0;
+int memsValue = 0;
+float objectDistance = -1;
+float waterDepth = -1;
+float latitude = 0.0;
+float longitude = 0.0;
+bool gpsValid = false;
+bool objectDetected = false;
+bool memsAbnormal = false;
+bool possibleWhirlpool = false;
+unsigned long lastThingSpeakUpdate = 0;
+bool lastTurnLeft = false;
+void IRAM_ATTR flowPulseISR()
+{
+  flowPulseCount++;
+}
+void stopRobot()
+{
+
+  digitalWrite(MOTOR_A_I1, LOW);
+  digitalWrite(MOTOR_A_I2, LOW);
+
+  digitalWrite(MOTOR_B_I3, LOW);
+  digitalWrite(MOTOR_B_I4, LOW);
+}
+
+void moveForward()
+{
+
+  digitalWrite(MOTOR_A_I1, HIGH);
+  digitalWrite(MOTOR_A_I2, LOW);
+  digitalWrite(MOTOR_B_I3, HIGH);
+  digitalWrite(MOTOR_B_I4, LOW);
+}
+
+void moveBackward()
+{
+
+  digitalWrite(MOTOR_A_I1, LOW);
+  digitalWrite(MOTOR_A_I2, HIGH);
+
+  digitalWrite(MOTOR_B_I3, LOW);
+  digitalWrite(MOTOR_B_I4, HIGH);
+}
+
+void turnLeft()
+{
+  
+  digitalWrite(MOTOR_A_I1, LOW);
+  digitalWrite(MOTOR_A_I2, HIGH);
+
+  digitalWrite(MOTOR_B_I3, HIGH);
+  digitalWrite(MOTOR_B_I4, LOW);
+}
+
+void turnRight()
+{
+  
+  digitalWrite(MOTOR_A_I1, HIGH);
+  digitalWrite(MOTOR_A_I2, LOW);
+
+  digitalWrite(MOTOR_B_I3, LOW);
+  digitalWrite(MOTOR_B_I4, HIGH);
+}
+
+
+float readUltrasonic(int trigPin, int echoPin)
+{
+  digitalWrite(trigPin, LOW);
+
+  delayMicroseconds(3);
+
+  digitalWrite(trigPin, HIGH);
+
+  delayMicroseconds(10);
+
+  digitalWrite(trigPin, LOW);
+
+  long duration =
+    pulseIn(echoPin, HIGH, 30000);
+
+  if (duration == 0)
+  {
+    return -1;
+  }
+
+  float distance =
+    duration * 0.0343 / 2.0;
+
+  return distance;
+}
+
+
+void readMEMS()
+{
+  memsValue = analogRead(MEMS_PIN);
+
+  if (memsValue > 4000)
+  {
+    memsAbnormal = true;
+  }
+  else
+  {
+    memsAbnormal = false;
+  }
+}
+
+
+void calculateFlow()
+{
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastFlowCalculation >= 1000)
+  {
+    noInterrupts();
+
+    unsigned long pulses =
+      flowPulseCount;
+
+    flowPulseCount = 0;
+
+    interrupts();
+
+    flowRate =
+      (pulses * 60.0) /
+      FLOW_PULSES_PER_LITER;
+
+
+    lastFlowCalculation =
+      currentTime;
+  }
+}
+
+
+void readGPS()
+{
+  while (GPS_Serial.available() > 0)
+  {
+    gps.encode(
+      GPS_Serial.read()
+    );
+  }
+
+  if (gps.location.isValid())
+  {
+    latitude =
+      gps.location.lat();
+
+    longitude =
+      gps.location.lng();
+
+    gpsValid = true;
+  }
+  else
+  {
+    gpsValid = false;
+  }
+}
+
+void readWaterDepth()
+{
+  float measuredDistance =
+    readUltrasonic(
+      DEPTH_TRIG_PIN,
+      DEPTH_ECHO_PIN
+    );
+
+
+  if (measuredDistance > 0)
+  {
+    waterDepth =
+      measuredDistance;
+  }
+}
+
+void detectWaterDisturbance()
+{
+  
+  if (
+    waterDepth < WHIRLPOOL_DEPTH_THRESHOLD &&
+    flowRate < WHIRLPOOL_FLOW_THRESHOLD
+  )
+  {
+    possibleWhirlpool = true;
+  }
+  else
+  {
+    possibleWhirlpool = false;
+  }
+}
+
+
+void updateTrafficLight()
+{
+  
+  if (
+    objectDetected ||
+    possibleWhirlpool ||
+    memsAbnormal
+  )
+  {
+    digitalWrite(
+      RED_LED,
+      HIGH
+    );
+
+    digitalWrite(
+      YELLOW_LED,
+      LOW
+    );
+
+    digitalWrite(
+      GREEN_LED,
+      LOW
+    );
+  }
+
+
+  else if (!gpsValid)
+  {
+    
+    digitalWrite(
+      RED_LED,
+      LOW
+    );
+
+    digitalWrite(
+      YELLOW_LED,
+      HIGH
+    );
+
+    digitalWrite(
+      GREEN_LED,
+      LOW
+    );
+  }
+
+
+  else
+  {
+  
+    digitalWrite(
+      RED_LED,
+      LOW
+    );
+
+    digitalWrite(
+      YELLOW_LED,
+      LOW
+    );
+
+    digitalWrite(
+      GREEN_LED,
+      HIGH
+    );
+  }
+}
+
+
+void autonomousNavigation()
+{
+  
+  if (
+    objectDistance > 0 &&
+    objectDistance <= OBJECT_THRESHOLD
+  )
+  {
+    objectDetected = true;
+
+
+    Serial.println();
+    Serial.println(
+      "************************************"
+    );
+
+    Serial.println(
+      "       OBJECT DETECTED"
+    );
+
+    Serial.print(
+      "Distance = "
+    );
+
+    Serial.print(
+      objectDistance
+    );
+
+    Serial.println(
+      " cm"
+    );
+
+    stopRobot();
+
+    delay(200);
+
+    Serial.println(
+      "Robot moving backward..."
+    );
+
+    moveBackward();
+
+    delay(
+      REVERSE_TIME
+    );
+
+    stopRobot();
+
+    delay(200);
+
+    if (!lastTurnLeft)
+    {
+      Serial.println(
+        "Trying LEFT..."
+      );
+
+
+      turnLeft();
+
+      delay(
+        TURN_TIME
+      );
+
+      stopRobot();
+
+      delay(150);
+
+      objectDistance =
+        readUltrasonic(
+          OBJECT_TRIG_PIN,
+          OBJECT_ECHO_PIN
+        );
+
+
+      if (
+        objectDistance > 0 &&
+        objectDistance <= OBJECT_THRESHOLD
+      )
+      {
+        Serial.println(
+          "LEFT path blocked."
+        );
+
+        Serial.println(
+          "Trying RIGHT..."
+        );
+
+
+        turnRight();
+
+        delay(
+          TURN_TIME * 2
+        );
+
+
+        stopRobot();
+      }
+
+
+      lastTurnLeft = true;
+    }
+    else
+    {
+      Serial.println(
+        "Trying RIGHT..."
+      );
+
+
+      turnRight();
+
+      delay(
+        TURN_TIME
+      );
+
+
+      stopRobot();
+
+      delay(150);
+
+
+      objectDistance =
+        readUltrasonic(
+          OBJECT_TRIG_PIN,
+          OBJECT_ECHO_PIN
+        );
+
+
+      if (
+        objectDistance > 0 &&
+        objectDistance <= OBJECT_THRESHOLD
+      )
+      {
+        Serial.println(
+          "RIGHT path blocked."
+        );
+
+        Serial.println(
+          "Trying LEFT..."
+        );
+
+        turnLeft();
+
+        delay(
+          TURN_TIME * 2
+        );
+
+
+        stopRobot();
+      }
+
+
+      lastTurnLeft = false;
+    }
+
+    Serial.println(
+      "Obstacle avoidance completed."
+    );
+
+    Serial.println(
+      "Both motors moving forward."
+    );
+
+
+    moveForward();
+
+    delay(200);
+  }
+
+  else
+  {
+
+    objectDetected = false;
+
+    moveForward();
+  }
+}
+
+void updateThingSpeak()
+{
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  )
+  {
+    Serial.println(
+      "WiFi not connected."
+    );
+
+    return;
+  }
+
+  HTTPClient http;
+
+
+  String url =
+    String(THINGSPEAK_URL);
+
+
+  url +=
+    "?api_key=";
+
+  url +=
+    THINGSPEAK_API_KEY;
+
+  url +=
+    "&field1=";
+
+  url +=
+    String(memsValue);
+
+  url +=
+    "&field2=";
+
+  url +=
+    String(flowRate, 2);
+
+  url +=
+    "&field3=";
+
+  url +=
+    String(objectDistance, 2);
+
+  url +=
+    "&field4=";
+
+  url +=
+    String(waterDepth, 2);
+
+  if (gpsValid)
+  {
+    url +=
+      "&field5=";
+
+    url +=
+      String(
+        latitude,
+        6
+      );
+
+    url +=
+      "&field6=";
+
+    url +=
+      String(
+        longitude,
+        6
+      );
+  }
+
+
+  int alertStatus = 0;
+
+  if (objectDetected)
+  {
+    alertStatus = 1;
+  }
+
+  else if (possibleWhirlpool)
+  {
+    alertStatus = 2;
+  }
+
+  else if (memsAbnormal)
+  {
+    alertStatus = 3;
+  }
+
+  else
+  {
+    alertStatus = 0;
+  }
+
+
+  url +=
+    "&field7=";
+
+  url +=
+    String(alertStatus);
+
+  int robotStatus = 0;
+
+  if (objectDetected)
+  {
+    robotStatus = 1;
+  }
+
+  else if (memsAbnormal)
+  {
+    robotStatus = 2;
+  }
+
+  else if (possibleWhirlpool)
+  {
+    robotStatus = 3;
+  }
+
+  else
+  {
+    robotStatus = 0;
+  }
+
+
+  url +=
+    "&field8=";
+
+  url +=
+    String(robotStatus);
+
+  http.begin(url);
+
+
+  int responseCode =
+    http.GET();
+
+
+  Serial.println();
+
+  Serial.println(
+    "========== THINGSPEAK =========="
+  );
+
+
+  if (responseCode > 0)
+  {
+    Serial.print(
+      "HTTP Response: "
+    );
+
+    Serial.println(
+      responseCode
+    );
+
+
+    String response =
+      http.getString();
+
+
+    Serial.print(
+      "ThingSpeak Entry ID: "
+    );
+
+    Serial.println(
+      response
+    );
+  }
+
+  else
+  {
+    Serial.print(
+      "ThingSpeak Error: "
+    );
+
+    Serial.println(
+      responseCode
+    );
+  }
+
+
+  Serial.println(
+    "================================"
+  );
+
+
+  http.end();
+}
+
+void printSensorValues()
+{
+  Serial.println();
+
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "      SMART RIVER MONITORING ROBOT"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.print(
+    "MEMS Value       : "
+  );
+
+  Serial.println(
+    memsValue
+  );
+
+
+  Serial.print(
+    "MEMS Status      : "
+  );
+
+
+  if (memsAbnormal)
+  {
+    Serial.println(
+      "ALERT - MEMS > 4000"
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "NORMAL"
+    );
+  }
+
+  Serial.print(
+    "Flow Rate        : "
+  );
+
+  Serial.print(
+    flowRate,
+    2
+  );
+
+  Serial.println(
+    " L/min"
+  );
+
+-------------------------------------------------
+
+  Serial.print(
+    "Object Distance  : "
+  );
+
+
+  if (objectDistance > 0)
+  {
+    Serial.print(
+      objectDistance,
+      2
+    );
+
+    Serial.println(
+      " cm"
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "No Reading"
+    );
+  }
+
+  Serial.print(
+    "Object Status    : "
+  );
+
+
+  if (objectDetected)
+  {
+    Serial.println(
+      "OBJECT DETECTED"
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "NO OBJECT"
+    );
+  }
+--------------------------------------------------
+
+  Serial.print(
+    "Water Depth      : "
+  );
+
+  Serial.print(
+    waterDepth,
+    2
+  );
+
+  Serial.println(
+    " cm"
+  );
+
+
+  Serial.print(
+    "Whirlpool Status : "
+  );
+
+
+  if (possibleWhirlpool)
+  {
+    Serial.println(
+      "WHIRLPOOL DETECTED"
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "NORMAL"
+    );
+  }
+
+  Serial.print(
+    "GPS Status       : "
+  );
+
+
+  if (gpsValid)
+  {
+    Serial.println(
+      "VALID"
+    );
+
+    Serial.print(
+      "Latitude         : "
+    );
+
+    Serial.println(
+      latitude,
+      6
+    );
+
+    Serial.print(
+      "Longitude        : "
+    );
+
+    Serial.println(
+      longitude,
+      6
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "NO GPS FIX"
+    );
+  }
+
+  Serial.print(
+    "Robot Status     : "
+  );
+
+
+  if (objectDetected)
+  {
+    Serial.println(
+      "OBJECT AVOIDANCE"
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "FORWARD - BOTH MOTORS"
+    );
+  }
+
+
+  Serial.println(
+    "=========================================="
+  );
+}
+
+void connectWiFi()
+{
+  Serial.println();
+
+  Serial.println(
+    "Connecting to WiFi..."
+  );
+
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  int attempts = 0;
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    attempts < 30
+  )
+  {
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  )
+  {
+    Serial.println(
+      "WiFi Connected!"
+    );
+
+
+    Serial.print(
+      "IP Address: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "WiFi Connection Failed!"
+    );
+  }
+}
+
+void setup()
+{
+  
+  Serial.begin(115200);
+  GPS_Serial.begin(
+    9600,
+    SERIAL_8N1,
+    GPS_RX_PIN,
+    GPS_TX_PIN
+  );
+
+  pinMode(
+    MEMS_PIN,
+    INPUT
+  );
+
+
+  pinMode(
+    FLOW_PIN,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    OBJECT_TRIG_PIN,
+    OUTPUT
+  );
+
+
+  pinMode(
+    OBJECT_ECHO_PIN,
+    INPUT
+  );
+
+
+  pinMode(
+    DEPTH_TRIG_PIN,
+    OUTPUT
+  );
+
+
+  pinMode(
+    DEPTH_ECHO_PIN,
+    INPUT
+  );
+
+  pinMode(
+    RED_LED,
+    OUTPUT
+  );
+
+
+  pinMode(
+    YELLOW_LED,
+    OUTPUT
+  );
+
+
+  pinMode(
+    GREEN_LED,
+    OUTPUT
+  );
+
+  pinMode(
+    MOTOR_A_I1,
+    OUTPUT
+  );
+
+
+  pinMode(
+    MOTOR_A_I2,
+    OUTPUT
+  );
+
+
+  pinMode(
+    MOTOR_B_I3,
+    OUTPUT
+  );
+
+  pinMode(
+    MOTOR_B_I4,
+    OUTPUT
+  );
+
+------------------------------------------------------
+
+  stopRobot();
+
+  digitalWrite(
+    RED_LED,
+    LOW
+  );
+
+  digitalWrite(
+    YELLOW_LED,
+    LOW
+  );
+
+  digitalWrite(
+    GREEN_LED,
+    LOW
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(FLOW_PIN),
+    flowPulseISR,
+    RISING
+  );
+
+  connectWiFi();
+--------------------------------------------------
+
+  Serial.println();
+
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    " SMART RIVER MONITORING ROBOT STARTED"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  Serial.println(
+    "Both motors will run FORWARD."
+  );
+
+
+  moveForward();
+
+
+  Serial.println(
+    "MOTOR A: FORWARD"
+  );
+
+  Serial.println(
+    "MOTOR B: FORWARD"
+  );
+
+
+  lastFlowCalculation =
+    millis();
+
+  lastThingSpeakUpdate =
+    millis();
+}
+
+void loop()
+{
+  
+  readGPS();
+  readMEMS();
+  calculateFlow();
+  objectDistance =
+    readUltrasonic(
+      OBJECT_TRIG_PIN,
+      OBJECT_ECHO_PIN
+    );
+  readWaterDepth();
+
+  detectWaterDisturbance();
+  autonomousNavigation();
+  updateTrafficLight();
+  printSensorValues();
+  if (
+    millis() -
+    lastThingSpeakUpdate
+    >=
+    THINGSPEAK_INTERVAL
+  )
+  {
+    updateThingSpeak();
+
+    lastThingSpeakUpdate =
+      millis();
+  }
+
+  delay(1000);
+}
