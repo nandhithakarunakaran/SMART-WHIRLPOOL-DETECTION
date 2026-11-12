@@ -1,0 +1,530 @@
+
+clc; clear; close all;
+
+%% ---------------- CONFIGURATION ----------------
+CHANNEL_ID    = 3519448;
+READ_API_KEY  = '6EO0VBLSPPY0TX98';
+POLL_SEC      = 15;              % ThingSpeak update interval (seconds)
+MAX_ITER      = 20;              % max live iterations before stopping
+LIVE_TIMEOUT  = 3;               % consecutive empty ticks => fallback
+DATASET_FILE  = 'whirlpool_dataset.mat';
+
+% --- Fallback history window (50-70 entries) ---
+HIST_RESULTS  = 60;              % fixed 60 entries; change to 50 or 70 as needed
+
+% Alert thresholds (same as ESP32 firmware)
+WHIRL_DEPTH = 30;   WHIRL_FLOW = 2;
+MEMS_LIMIT  = 4000; OBJ_LIMIT  = 10;
+
+% Class names and colors
+classNames  = {'Normal','Object','Whirlpool','MEMS_Abnormal'};
+classColors = [0.20 0.70 0.30;   % green  - Normal
+               0.95 0.70 0.10;   % amber  - Object
+               0.90 0.20 0.25;   % red    - Whirlpool
+               0.55 0.40 0.85];  % purple - MEMS_Abnormal
+
+fprintf('=====================================================\n');
+fprintf('  IoT Whirlpool Detection - Random Forest (Final)\n');
+fprintf('=====================================================\n\n');
+
+%% ================= STEP 1: LOAD DATASET =================
+fprintf('[1/5] Loading dataset...\n');
+if ~isfile(DATASET_FILE)
+    error('Dataset not found: %s\nRun the dataset creation script first.', DATASET_FILE);
+end
+load(DATASET_FILE, 'T');
+
+featureNames = {'MEMS','FLOW','ULTRASONIC','TRANSDUCER'};
+X = T{:, featureNames};
+Y = categorical(T.Label, [0 1 2 3], classNames);
+
+fprintf('      Loaded %d samples.\n', height(T));
+fprintf('      Class distribution:\n');
+for i = 1:numel(classNames)
+    fprintf('        %-15s : %6d\n', classNames{i}, sum(Y==classNames{i}));
+end
+
+%% ================= STEP 2: TRAIN RANDOM FOREST =================
+fprintf('\n[2/5] Training Random Forest...\n');
+
+cv  = cvpartition(Y, 'HoldOut', 0.30);
+Xtr = X(training(cv),:);  Ytr = Y(training(cv),:);
+Xte = X(test(cv),    :);  Yte = Y(test(cv),    :);
+
+tStart = tic;
+rfModel = TreeBagger(150, Xtr, Ytr, ...
+    'Method',                'classification', ...
+    'OOBPrediction',         'on', ...
+    'OOBPredictorImportance','on', ...
+    'MinLeafSize',           5, ...
+    'NumPredictorsToSample', 'all', ...
+    'Prior',                 'empirical');
+trainTime = toc(tStart);
+
+Ypred    = categorical(predict(rfModel, Xte), classNames);
+accuracy = mean(Ypred == Yte);
+
+fprintf('      Training time  : %.2f s\n', trainTime);
+fprintf('      Trees          : %d\n', rfModel.NumTrees);
+fprintf('      OOB error      : %.4f\n', mean(oobError(rfModel)));
+fprintf('      Test accuracy  : %.2f%%\n', accuracy*100);
+
+% Confusion matrix
+figure('Name','RF Confusion Matrix','Position',[100 100 700 500]);
+cm = confusionchart(Yte, Ypred);
+cm.Title = sprintf('Random Forest Confusion Matrix (Acc = %.2f%%)', accuracy*100);
+cm.RowSummary = 'row-normalized';  cm.ColumnSummary = 'column-normalized';
+
+% Feature importance
+imp = rfModel.OOBPermutedPredictorDeltaError;
+figure('Name','Feature Importance','Position',[100 100 700 400]);
+bar(imp, 'FaceColor', [0.20 0.60 0.85]);
+set(gca,'XTickLabel',featureNames);
+ylabel('OOB Permuted Predictor Importance');
+title('Random Forest - Feature Importance'); grid on;
+
+% OOB error curve
+figure('Name','OOB Error Convergence','Position',[100 100 700 400]);
+plot(oobError(rfModel),'LineWidth',1.8,'Color',[0.20 0.60 0.85]);
+xlabel('Number of Trees'); ylabel('OOB Error');
+title('Random Forest - OOB Error vs Trees'); grid on;
+
+fprintf('\n      Feature importance:\n');
+[~, ord] = sort(imp,'descend');
+for i = 1:numel(ord)
+    fprintf('        %-12s : %.4f\n', featureNames{ord(i)}, imp(ord(i)));
+end
+
+%% ================= STEP 3: THINGSPEAK SETUP =================
+fprintf('\n[3/5] Connecting to ThingSpeak...\n');
+baseURL = sprintf('https://api.thingspeak.com/channels/%d/feeds.json', CHANNEL_ID);
+
+connected = false;
+lastEntryID = 0;
+try
+    initData = webread(baseURL,'api_key',READ_API_KEY,'results',1);
+    if ~isempty(initData.feeds)
+        lastEntryID = initData.feeds(end).entry_id;
+        fprintf('      Connected. Last entry ID = %d\n', lastEntryID);
+        connected = true;
+    else
+        fprintf('      [!] No data returned from channel.\n');
+    end
+catch ME
+    fprintf('      [!] Connect failed: %s\n', ME.message);
+end
+
+if ~connected
+    fprintf('\n      >> Going straight to fallback batch analysis.\n');
+    runFallbackAnalysis(rfModel, baseURL, READ_API_KEY, HIST_RESULTS, ...
+        featureNames, classNames, classColors, ...
+        WHIRL_DEPTH, WHIRL_FLOW, MEMS_LIMIT, OBJ_LIMIT);
+    save('whirlpool_rf_model.mat','rfModel','featureNames','classNames');
+    fprintf('\nModel saved to whirlpool_rf_model.mat\n');
+    return;
+end
+
+%% ================= STEP 4: LIVE PREDICTION LOOP =================
+fprintf('\n[4/5] Starting live prediction loop...\n');
+fprintf('-----------------------------------------------------\n');
+
+% Rolling history
+histLen   = 60;
+histMEMS  = nan(histLen,1);  histFLOW  = nan(histLen,1);
+histUS    = nan(histLen,1);  histDEPTH = nan(histLen,1);
+histLabel = nan(histLen,1);
+
+% Dashboard figure
+hFig = figure('Name','Live Whirlpool Detection Dashboard', ...
+              'Position',[200 80 1200 700],'Color','w');
+
+noNewCount   = 0;
+fallbackDone = false;
+
+for iter = 1:MAX_ITER
+
+    fetchData = [];
+    try
+        fetchData = webread(baseURL,'api_key',READ_API_KEY,'results',1);
+    catch ME
+        fprintf('  [!] Fetch failed: %s\n', ME.message);
+    end
+
+    gotNew = ~isempty(fetchData) && ~isempty(fetchData.feeds) && ...
+             (fetchData.feeds(end).entry_id ~= lastEntryID);
+
+    if gotNew
+        % ---------- LIVE PATH ----------
+        noNewCount = 0;
+        feed = fetchData.feeds(end);
+        lastEntryID = feed.entry_id;
+
+        mems  = safeNum(feed.field1);
+        flow  = safeNum(feed.field2);
+        us    = safeNum(feed.field3);
+        depth = safeNum(feed.field4);
+        ts    = feed.created_at;
+
+        if any(isnan([mems flow us depth]))
+            fprintf('  [%02d] Skipped (incomplete fields)\n', iter);
+        else
+            [finalClass, predIdx, confidence, ruleAlert] = ...
+                classifyOne(rfModel, classNames, mems, flow, us, depth, ...
+                            WHIRL_DEPTH, WHIRL_FLOW, MEMS_LIMIT, OBJ_LIMIT);
+
+            fprintf('  [%02d] %s | MEMS=%6.1f FLOW=%5.2f US=%5.1f DEPTH=%5.1f ', ...
+                iter, ts(12:19), mems, flow, us, depth);
+            fprintf('=> %-15s (%.1f%%)', finalClass, confidence);
+            if ~isempty(ruleAlert), fprintf(' [RULE: %s]', ruleAlert); end
+            if ~strcmp(finalClass,'Normal'), fprintf('  *** ALERT ***'); end
+            fprintf('\n');
+
+            % Update rolling history
+            histMEMS  = [histMEMS(2:end);  mems];
+            histFLOW  = [histFLOW(2:end);  flow];
+            histUS    = [histUS(2:end);    us];
+            histDEPTH = [histDEPTH(2:end); depth];
+            histLabel = [histLabel(2:end); predIdx];
+
+            if isvalid(hFig)
+                drawDashboard(hFig, histMEMS, histFLOW, histUS, histDEPTH, ...
+                    histLabel, classNames, classColors, finalClass, ...
+                    confidence, iter, MAX_ITER);
+            end
+
+            if ~strcmp(finalClass,'Normal')
+                fireAlert(finalClass);
+            end
+        end
+
+    else
+        % ---------- NO NEW DATA ----------
+        noNewCount = noNewCount + 1;
+        fprintf('  [%02d] No new entry (streak = %d)\n', iter, noNewCount);
+
+        if noNewCount >= LIVE_TIMEOUT && ~fallbackDone
+            fprintf('\n  >>> Live data unavailable for %d ticks.\n', LIVE_TIMEOUT);
+            fprintf('  >>> Switching to FALLBACK: pulling last %d entries...\n\n', HIST_RESULTS);
+
+            ok = runFallbackAnalysis(rfModel, baseURL, READ_API_KEY, HIST_RESULTS, ...
+                featureNames, classNames, classColors, ...
+                WHIRL_DEPTH, WHIRL_FLOW, MEMS_LIMIT, OBJ_LIMIT);
+
+            fallbackDone = true;
+            if ok
+                fprintf('\n  >>> Fallback complete. Exiting live loop.\n');
+                break;
+            else
+                fprintf('  [!] Fallback failed. Continuing live polling.\n');
+                noNewCount = 0;
+            end
+        end
+    end
+
+    pause(POLL_SEC);
+end
+
+fprintf('-----------------------------------------------------\n');
+fprintf('[5/5] Session ended. Saving model...\n');
+save('whirlpool_rf_model.mat','rfModel','featureNames','classNames');
+fprintf('      Model saved to whirlpool_rf_model.mat\n');
+
+
+%% ========================================================================
+%                       FALLBACK BATCH ANALYSIS
+%% ========================================================================
+function ok = runFallbackAnalysis(rfModel, baseURL, apiKey, N, ...
+    featureNames, classNames, classColors, ...
+    WHIRL_DEPTH, WHIRL_FLOW, MEMS_LIMIT, OBJ_LIMIT)
+% Fetch last N entries from ThingSpeak and analyze as a batch.
+
+    ok = false;
+    fprintf('  Fetching last %d historical entries...\n', N);
+
+    try
+        hist = webread(baseURL,'api_key',apiKey,'results',N);
+    catch ME
+        fprintf('  [!] Fallback fetch failed: %s\n', ME.message);
+        return;
+    end
+
+    if isempty(hist.feeds)
+        fprintf('  [!] No historical data returned.\n');
+        return;
+    end
+
+    n = numel(hist.feeds);
+    MEMS = nan(n,1);  FLOW = nan(n,1);
+    US   = nan(n,1);  DEPTH = nan(n,1);
+    timeStr  = strings(n,1);
+    entryIDs = nan(n,1);
+
+    for i = 1:n
+        f = hist.feeds(i);
+        MEMS(i)  = safeNum(f.field1);
+        FLOW(i)  = safeNum(f.field2);
+        US(i)    = safeNum(f.field3);
+        DEPTH(i) = safeNum(f.field4);
+        timeStr(i)  = string(f.created_at);
+        entryIDs(i) = f.entry_id;
+    end
+
+    valid = ~isnan(MEMS) & ~isnan(FLOW) & ~isnan(US) & ~isnan(DEPTH);
+    fprintf('  Received %d entries, %d valid.\n', n, sum(valid));
+
+    if ~any(valid)
+        fprintf('  [!] No valid entries to analyze.\n');
+        return;
+    end
+
+    % ---- RF batch prediction ----
+    Xh = [MEMS(valid), FLOW(valid), US(valid), DEPTH(valid)];
+    [predCell, scores] = predict(rfModel, Xh);
+    predClass  = categorical(predCell, classNames);
+    confidence = max(scores,[],2) * 100;
+
+    % ---- Rule-based override ----
+    finalClass = predClass;
+    ruleFlags  = strings(numel(finalClass),1);
+    vMEMS  = MEMS(valid);  vFLOW  = FLOW(valid);
+    vUS    = US(valid);    vDEPTH = DEPTH(valid);
+
+    for k = 1:numel(finalClass)
+        rule = "";
+        if vMEMS(k) > MEMS_LIMIT
+            rule = "MEMS_Abnormal";
+        elseif vUS(k) > 0 && vUS(k) <= OBJ_LIMIT
+            rule = "Object";
+        elseif vDEPTH(k) < WHIRL_DEPTH && vFLOW(k) < WHIRL_FLOW
+            rule = "Whirlpool";
+        end
+        if rule ~= ""
+            finalClass(k) = categorical(rule, classNames);
+            ruleFlags(k)  = rule;
+        end
+    end
+
+    % ---- Summary report ----
+    fprintf('\n  =============== FALLBACK BATCH ANALYSIS ===============\n');
+    fprintf('  Samples analysed : %d\n\n', numel(finalClass));
+
+    cats = categories(finalClass);
+    fprintf('  Final class counts (after RF + rule override):\n');
+    for i = 1:numel(cats)
+        c = cats{i};
+        cnt = sum(finalClass == c);
+        fprintf('    %-15s : %5d  (%.2f%%)\n', c, cnt, 100*cnt/numel(finalClass));
+    end
+
+    fprintf('\n  Rule-based alerts triggered:\n');
+    for c = ["Object","Whirlpool","MEMS_Abnormal"]
+        cnt = sum(ruleFlags == c);
+        fprintf('    %-15s : %5d\n', c, cnt);
+    end
+
+    % ---- First 10 alerts ----
+    alertMask = finalClass ~= categorical("Normal", classNames);
+    idxValid  = find(valid);
+    if any(alertMask)
+        fprintf('\n  First 10 alerts:\n');
+        idxA = find(alertMask);
+        for i = 1:min(10, numel(idxA))
+            k = idxA(i);
+            fprintf('    %s -> %-15s (conf %5.1f%%)  MEMS=%.0f FLOW=%.2f US=%.1f DEPTH=%.1f\n', ...
+                timeStr(idxValid(k)), finalClass(k), confidence(k), ...
+                vMEMS(k), vFLOW(k), vUS(k), vDEPTH(k));
+        end
+    else
+        fprintf('\n  No alerts in the history window.\n');
+    end
+
+    % ---- Figure 1: sensor time series with alert markers ----
+    tV = 1:sum(valid);
+    figure('Name','Fallback - Sensor Time Series', ...
+           'Position',[100 100 1200 800]);
+
+    subplot(4,1,1); hold on;
+    plot(tV, vMEMS, 'Color',[0.20 0.60 0.85],'LineWidth',1.3);
+    addAlertMarkers(tV, vMEMS, finalClass, classColors, classNames);
+    yline(MEMS_LIMIT,'r--','LineWidth',1);
+    ylabel('MEMS'); title('MEMS with alert markers'); grid on; hold off;
+
+    subplot(4,1,2); hold on;
+    plot(tV, vFLOW, 'Color',[0.20 0.70 0.30],'LineWidth',1.3);
+    addAlertMarkers(tV, vFLOW, finalClass, classColors, classNames);
+    yline(WHIRL_FLOW,'r--','LineWidth',1);
+    ylabel('Flow (L/min)'); title('Flow with alert markers'); grid on; hold off;
+
+    subplot(4,1,3); hold on;
+    plot(tV, vUS, 'Color',[0.95 0.70 0.10],'LineWidth',1.3);
+    addAlertMarkers(tV, vUS, finalClass, classColors, classNames);
+    yline(OBJ_LIMIT,'r--','LineWidth',1);
+    ylabel('Ultrasonic (cm)'); title('Ultrasonic with alert markers'); grid on; hold off;
+
+    subplot(4,1,4); hold on;
+    plot(tV, vDEPTH, 'Color',[0.55 0.40 0.85],'LineWidth',1.3);
+    addAlertMarkers(tV, vDEPTH, finalClass, classColors, classNames);
+    yline(WHIRL_DEPTH,'r--','LineWidth',1);
+    ylabel('Depth (cm)'); xlabel('Sample #');
+    title('Water Depth with alert markers'); grid on; hold off;
+
+    sgtitle(sprintf('Fallback Analysis - Last %d Entries', sum(valid)), ...
+        'FontWeight','bold');
+
+    % ---- Figure 2: class timeline + pie ----
+    figure('Name','Fallback - Class Timeline & Distribution', ...
+           'Position',[150 150 1200 500]);
+
+    subplot(1,2,1);
+    imagesc(1:numel(finalClass), 1, double(finalClass)');
+    colormap(gca, classColors); caxis([1 numel(classNames)]);
+    cb = colorbar; cb.Ticks = 1:numel(classNames);
+    cb.TickLabels = classNames;
+    xlabel('Sample #'); yticks([]);
+    title('Predicted class over time');
+
+    subplot(1,2,2);
+    counts = zeros(1,numel(classNames));
+    for i = 1:numel(classNames)
+        counts(i) = sum(finalClass == classNames{i});
+    end
+    pie(counts, logical(counts));
+    title('Class distribution');
+    legend(classNames,'Location','bestoutside');
+
+    % ---- Save CSV ----
+    Tbatch = table(timeStr(valid), vMEMS, vFLOW, vUS, vDEPTH, ...
+                   predClass, finalClass, confidence, ruleFlags, ...
+        'VariableNames', {'Timestamp','MEMS','FLOW','ULTRASONIC', ...
+                          'TRANSDUCER','RF_Prediction','Final_Class', ...
+                          'Confidence','Rule_Override'});
+    writetable(Tbatch, 'whirlpool_fallback_results.csv');
+    fprintf('\n  Batch results saved to whirlpool_fallback_results.csv\n');
+    fprintf('  =======================================================\n\n');
+
+    ok = true;
+end
+
+
+%% ========================================================================
+%                          HELPER FUNCTIONS
+%% ========================================================================
+function v = safeNum(s)
+    if isempty(s) || (isstring(s) && strlength(s)==0)
+        v = NaN;
+    else
+        v = str2double(s);
+    end
+end
+
+function [finalClass, predIdx, confidence, ruleAlert] = classifyOne( ...
+        rfModel, classNames, mems, flow, us, depth, ...
+        WHIRL_DEPTH, WHIRL_FLOW, MEMS_LIMIT, OBJ_LIMIT)
+
+    Xlive = [mems flow us depth];
+    [predLabel, scores] = predict(rfModel, Xlive);
+    predClass  = predLabel{1};
+    predIdx    = find(strcmp(classNames, predClass));
+    confidence = max(scores) * 100;
+
+    ruleAlert = '';
+    if mems > MEMS_LIMIT
+        ruleAlert = 'MEMS_Abnormal';
+    elseif us > 0 && us <= OBJ_LIMIT
+        ruleAlert = 'Object';
+    elseif depth < WHIRL_DEPTH && flow < WHIRL_FLOW
+        ruleAlert = 'Whirlpool';
+    end
+
+    finalClass = predClass;
+    if ~isempty(ruleAlert) && ~strcmp(ruleAlert, predClass)
+        finalClass = ruleAlert;
+    end
+end
+
+function addAlertMarkers(x, y, cls, colors, names)
+    for c = 1:numel(names)
+        if strcmp(names{c},'Normal'), continue; end
+        m = (cls == names{c});
+        if any(m)
+            scatter(x(m), y(m), 30, colors(c,:), 'filled', ...
+                    'MarkerEdgeColor','k');
+        end
+    end
+end
+
+function drawDashboard(hFig, mems, flow, us, depth, labels, ...
+                       classNames, classColors, finalClass, conf, ...
+                       iter, maxIter)
+
+    figure(hFig); clf(hFig);
+
+    if strcmp(finalClass,'Normal')
+        bannerColor = [0.85 0.95 0.88];
+        textColor   = [0.10 0.50 0.28];
+        icon        = 'OK';
+    else
+        bannerColor = [1.00 0.88 0.90];
+        textColor   = [0.70 0.10 0.18];
+        icon        = 'ALERT';
+    end
+
+    annotation('rectangle',[0 0.93 1 0.07],'Color','none','FaceColor',bannerColor);
+    annotation('textbox',[0 0.93 1 0.07], ...
+        'String', sprintf('%s  %s   (confidence %.1f%%)', icon, upper(finalClass), conf), ...
+        'EdgeColor','none','HorizontalAlignment','center', ...
+        'VerticalAlignment','middle','FontSize',16, ...
+        'FontWeight','bold','Color',textColor);
+
+    ax1 = subplot(2,2,1); plot(mems,'LineWidth',1.6,'Color',[0.20 0.60 0.85]);
+    title(sprintf('MEMS (current = %.0f)', mems(end)));
+    xlabel('Samples'); ylabel('ADC'); grid on;
+
+    ax2 = subplot(2,2,2); plot(flow,'LineWidth',1.6,'Color',[0.20 0.70 0.30]);
+    title(sprintf('Flow (current = %.2f L/min)', flow(end)));
+    xlabel('Samples'); ylabel('L/min'); grid on;
+
+    ax3 = subplot(2,2,3); plot(us,'LineWidth',1.6,'Color',[0.95 0.70 0.10]);
+    title(sprintf('Ultrasonic (current = %.1f cm)', us(end)));
+    xlabel('Samples'); ylabel('cm'); grid on;
+
+    ax4 = subplot(2,2,4); plot(depth,'LineWidth',1.6,'Color',[0.55 0.40 0.85]);
+    title(sprintf('Water Depth (current = %.1f cm)', depth(end)));
+    xlabel('Samples'); ylabel('cm'); grid on;
+
+    validIdx = ~isnan(labels);
+    if any(validIdx)
+        hold(ax1,'on');
+        for c = 1:numel(classNames)
+            m = validIdx & (labels==c);
+            if any(m)
+                scatter(ax1, find(m), mems(m), 40, classColors(c,:), 'filled');
+            end
+        end
+        hold(ax1,'off');
+
+        hold(ax4,'on');
+        for c = 1:numel(classNames)
+            m = validIdx & (labels==c);
+            if any(m)
+                scatter(ax4, find(m), depth(m), 40, classColors(c,:), 'filled');
+            end
+        end
+        hold(ax4,'off');
+    end
+
+    sgtitle(sprintf('Live Whirlpool Detection  |  Iteration %d / %d', ...
+        iter, maxIter), 'FontSize',13,'FontWeight','bold');
+    drawnow limitrate;
+end
+
+function fireAlert(classType)
+    switch classType
+        case 'Whirlpool',      msg = 'ALERT: WHIRLPOOL DETECTED';
+        case 'Object',         msg = 'ALERT: OBJECT DETECTED';
+        case 'MEMS_Abnormal',  msg = 'ALERT: MEMS ABNORMAL VIBRATION';
+        otherwise, return;
+    end
+    fprintf('       >>> %s <<<\n', msg);
+    try, beep; catch, end
+end
